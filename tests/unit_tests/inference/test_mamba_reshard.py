@@ -23,20 +23,23 @@ from megatron.core.inference.disaggregation.mamba_reshard import (
 def apply_conv_transfer(t, src_conv, dst_conv):
     """Copy a conv sub-block in-memory (no transfer); conv is
     ``(num_layers, conv_dim_local, d_conv)`` -- the band slices the channel axis."""
-    dst_conv[t.dst_layer, t.dst_lo:t.dst_hi, :] = src_conv[t.src_layer, t.src_lo:t.src_hi, :]
+    dst_conv[t.dst_layer, t.dst_lo : t.dst_hi, :] = src_conv[t.src_layer, t.src_lo : t.src_hi, :]
 
 
 def apply_ssm_transfer(t, src_ssm, dst_ssm):
     """Copy an ssm sub-block in-memory; ssm is
     ``(num_layers, nheads_local, headdim, d_state)`` -- the band slices heads."""
-    dst_ssm[t.dst_layer, t.dst_lo:t.dst_hi, :, :] = src_ssm[t.src_layer, t.src_lo:t.src_hi, :, :]
+    dst_ssm[t.dst_layer, t.dst_lo : t.dst_hi, :, :] = src_ssm[
+        t.src_layer, t.src_lo : t.src_hi, :, :
+    ]
+
 
 # Global model dims (chosen divisible by the tp values under test).
 NHEADS, HEADDIM, DSTATE, NGROUPS, DCONV = 8, 4, 2, 2, 3
 M = 4  # global Mamba layers
-D_INNER = NHEADS * HEADDIM            # 32
-G = NGROUPS * DSTATE                  # 4  (B and C band global size)
-CONV_DIM = D_INNER + 2 * G            # 40
+D_INNER = NHEADS * HEADDIM  # 32
+G = NGROUPS * DSTATE  # 4  (B and C band global size)
+CONV_DIM = D_INNER + 2 * G  # 40
 
 
 def _global_state():
@@ -60,10 +63,14 @@ def _layouts(tp, pp):
         for r in range(tp):
             rank = p * tp + r
             out[rank] = MambaShardLayout(
-                global_rank=rank, tp_size=tp, tp_rank=r,
-                layer_start=p * per, num_layers=per,
-                dims=MambaStateDims(nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE,
-                                    ngroups=NGROUPS, d_conv=DCONV),
+                global_rank=rank,
+                tp_size=tp,
+                tp_rank=r,
+                layer_start=p * per,
+                num_layers=per,
+                dims=MambaStateDims(
+                    nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE, ngroups=NGROUPS, d_conv=DCONV
+                ),
             )
     return out
 
@@ -74,24 +81,24 @@ def _shard(conv_g, ssm_g, lay: MambaShardLayout):
     r, tp = lay.tp_rank, lay.tp_size
     di_l = D_INNER // tp
     g_l = (NGROUPS // tp) * DSTATE
-    x = conv_g[s:e, 0:D_INNER][:, r * di_l:(r + 1) * di_l]
-    b = conv_g[s:e, D_INNER:D_INNER + G][:, r * g_l:(r + 1) * g_l]
-    c = conv_g[s:e, D_INNER + G:D_INNER + 2 * G][:, r * g_l:(r + 1) * g_l]
+    x = conv_g[s:e, 0:D_INNER][:, r * di_l : (r + 1) * di_l]
+    b = conv_g[s:e, D_INNER : D_INNER + G][:, r * g_l : (r + 1) * g_l]
+    c = conv_g[s:e, D_INNER + G : D_INNER + 2 * G][:, r * g_l : (r + 1) * g_l]
     conv_l = torch.cat([x, b, c], dim=1).contiguous()
     nh_l = NHEADS // tp
-    ssm_l = ssm_g[s:e, r * nh_l:(r + 1) * nh_l, :, :].contiguous()
+    ssm_l = ssm_g[s:e, r * nh_l : (r + 1) * nh_l, :, :].contiguous()
     return conv_l, ssm_l
 
 
 @pytest.mark.parametrize(
     "src,dst",
     [
-        ((2, 1), (1, 1)),   # TP2 -> TP1 (band merge)
-        ((1, 1), (2, 1)),   # TP1 -> TP2 (band split)
-        ((1, 2), (1, 1)),   # PP2 -> PP1 (layer merge)
-        ((1, 1), (1, 2)),   # PP1 -> PP2 (layer split)
-        ((2, 2), (1, 1)),   # both axes hetero
-        ((2, 1), (2, 1)),   # identity
+        ((2, 1), (1, 1)),  # TP2 -> TP1 (band merge)
+        ((1, 1), (2, 1)),  # TP1 -> TP2 (band split)
+        ((1, 2), (1, 1)),  # PP2 -> PP1 (layer merge)
+        ((1, 1), (1, 2)),  # PP1 -> PP2 (layer split)
+        ((2, 2), (1, 1)),  # both axes hetero
+        ((2, 1), (2, 1)),  # identity
     ],
 )
 def test_mamba_reshard_reconstructs_destination(src, dst):
@@ -126,20 +133,33 @@ def test_mamba_rejects_indivisible_groups():
     """ngroups < tp_size would truncate the B/C bands to zero width; reject it
     up front instead of silently dropping state."""
     with pytest.raises(ValueError):
-        MambaShardLayout(global_rank=0, tp_size=4, tp_rank=0, layer_start=0, num_layers=1,
-                         dims=MambaStateDims(nheads=8, headdim=HEADDIM, d_state=DSTATE,
-                                             ngroups=2, d_conv=DCONV))
+        MambaShardLayout(
+            global_rank=0,
+            tp_size=4,
+            tp_rank=0,
+            layer_start=0,
+            num_layers=1,
+            dims=MambaStateDims(nheads=8, headdim=HEADDIM, d_state=DSTATE, ngroups=2, d_conv=DCONV),
+        )
 
 
 def test_mamba_dedupes_replica_sources():
     """Two source ranks holding the same Mamba shard (same tp_rank+layer_start,
     e.g. EP/DP replicas) are deduped: the shard is sourced from exactly one of
     them (smallest global_rank), so no duplicate sends."""
+
     def _lay(gr):
-        return MambaShardLayout(global_rank=gr, tp_size=1, tp_rank=0, layer_start=0,
-                                num_layers=M, dims=MambaStateDims(
-                                    nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE,
-                                    ngroups=NGROUPS, d_conv=DCONV))
+        return MambaShardLayout(
+            global_rank=gr,
+            tp_size=1,
+            tp_rank=0,
+            layer_start=0,
+            num_layers=M,
+            dims=MambaStateDims(
+                nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE, ngroups=NGROUPS, d_conv=DCONV
+            ),
+        )
+
     plan = plan_mamba_reshard([_lay(0), _lay(1)], [_lay(2)])
     assert {t.src_rank for t in plan} == {0}  # only the smallest-rank replica sources
 
@@ -151,11 +171,15 @@ def test_layout_wire_roundtrip():
     import dataclasses
 
     lay = MambaShardLayout(
-        global_rank=1, tp_size=2, tp_rank=1, layer_start=0, num_layers=M,
-        dims=MambaStateDims(nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE,
-                            ngroups=NGROUPS, d_conv=DCONV),
+        global_rank=1,
+        tp_size=2,
+        tp_rank=1,
+        layer_start=0,
+        num_layers=M,
+        dims=MambaStateDims(
+            nheads=NHEADS, headdim=HEADDIM, d_state=DSTATE, ngroups=NGROUPS, d_conv=DCONV
+        ),
     )
     rebuilt = MambaShardLayout(**dataclasses.asdict(lay))
     assert rebuilt == lay
     assert rebuilt.headdim == HEADDIM and rebuilt.d_conv == DCONV
-
